@@ -51,10 +51,11 @@ PERIODOS = {
     "Tudo": None,
 }
 
-COR = "#0F6E7A"
-COR_ALERTA = "#C98A1B"
-COR_CRITICA = "#C0392B"
-COR_OK = "#3A8F5C"
+# Tons médios: contraste suficiente tanto no fundo claro quanto no escuro
+COR = "#0E8A96"
+COR_ALERTA = "#E08E0B"
+COR_CRITICA = "#E5484D"
+COR_OK = "#2F9E5B"
 
 
 st.set_page_config(
@@ -85,20 +86,34 @@ st.markdown(
         max-width: 1400px;
     }}
 
+    /* As superfícies derivam da cor do texto do tema do Streamlit
+       (escura no light, clara no dark), então acompanham o tema
+       escolhido no app, e não o do sistema operacional. */
+    :root {{
+        --superficie: color-mix(in srgb, currentColor 4%, transparent);
+        --superficie-2: color-mix(in srgb, currentColor 6%, transparent);
+        --borda: color-mix(in srgb, currentColor 18%, transparent);
+    }}
+
     div[data-testid="stMetric"] {{
-        background: #FFFFFF;
-        border: 1px solid #E3E6E3;
+        background: var(--superficie);
+        border: 1px solid var(--borda);
         border-left: 4px solid {COR};
         border-radius: 8px;
         padding: 14px 18px;
     }}
 
     div[data-testid="stMetricLabel"] p {{
-        color: #5B6A6E;
+        color: inherit;
+        opacity: 0.8;
+        font-weight: 500;
     }}
 
-    section[data-testid="stSidebar"] {{
-        background: #F1F3F1;
+    .cartao-status {{
+        padding: 10px 12px;
+        border-radius: 8px;
+        background: var(--superficie-2);
+        border: 1px solid var(--borda);
     }}
     </style>
     """,
@@ -416,12 +431,8 @@ def painel(modo, maquina_nome, periodo_nome, limites_usuario):
 
                 st.markdown(
                     f"""
-                    <div style="
-                        padding: 10px 12px;
-                        border-radius: 8px;
-                        background: #F4F6F4;
-                        border-left: 4px solid {item['Cor']};
-                    ">
+                    <div class="cartao-status"
+                         style="border-left: 4px solid {item['Cor']};">
                         <strong>{item['Status']}</strong><br>
                         <span style="font-size: 0.85rem;">
                             Última medição:<br>
@@ -596,15 +607,16 @@ def painel(modo, maquina_nome, periodo_nome, limites_usuario):
             )
 
         fig.update_layout(
-            template="simple_white",
             height=430,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
             hovermode="x unified",
             margin=dict(l=10, r=10, t=25, b=10),
         )
 
         fig.update_yaxes(
             title=cfg["unidade"] if cfg else variavel,
-            gridcolor="#E9ECE9",
+            gridcolor="rgba(128,128,128,0.25)",
         )
 
         st.plotly_chart(
@@ -639,12 +651,12 @@ def painel(modo, maquina_nome, periodo_nome, limites_usuario):
 
             if limite is not None and linha["Valor"] > limite:
                 estilos[linha.index.get_loc("Valor")] = (
-                    "color: #C0392B; font-weight: bold;"
+                    "background-color: rgba(229,72,77,0.22); font-weight: bold;"
                 )
 
                 if "Situação" in linha.index:
                     estilos[linha.index.get_loc("Situação")] = (
-                        "color: #C0392B; font-weight: bold;"
+                        "background-color: rgba(229,72,77,0.22); font-weight: bold;"
                     )
 
             return estilos
