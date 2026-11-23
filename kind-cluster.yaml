@@ -4,11 +4,11 @@ name: monitoramento
 nodes:
   - role: control-plane
     extraPortMappings:
-      # broker MQTT acessível na LAN para a ESP32
-      - containerPort: 31883
-        hostPort: 1883
+      # gateway acessível na LAN para a ESP32 (http://<ip-do-pc>:8000)
+      - containerPort: 30000
+        hostPort: 8000
         protocol: TCP
-      # dashboard via NodePort
+      # dashboard (http://localhost:8080)
       - containerPort: 30080
         hostPort: 8080
         protocol: TCP

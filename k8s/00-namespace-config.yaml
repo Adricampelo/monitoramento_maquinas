@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoramento
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: interscity
+  namespace: monitoramento
+data:
+  INTERSCITY_URL: https://cidadesinteligentes.lsdi.ufma.br/interscity_lh
+  # id do dispositivo -> uuid do recurso no InterSCity (usado pelo gateway)
+  MAQUINAS: maq-001=bcb2ade2-946f-4df2-a501-56e41c259cb7,maq-002=41bdd388-b2c1-4fc4-99eb-8668c4ef5c07
+  # nome exibido -> uuid (usado pelo dashboard)
+  MAQUINAS_DASHBOARD: Máquina 001=bcb2ade2-946f-4df2-a501-56e41c259cb7,Máquina 002=41bdd388-b2c1-4fc4-99eb-8668c4ef5c07

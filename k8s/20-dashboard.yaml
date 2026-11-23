@@ -22,9 +22,9 @@ spec:
           ports:
             - name: http
               containerPort: 8501
-          env:
-            - name: API_URL
-              value: http://api:8000
+          envFrom:
+            - configMapRef:
+                name: interscity
           readinessProbe:
             httpGet:
               path: /_stcore/health
@@ -43,12 +43,8 @@ spec:
               memory: 256Mi
             limits:
               memory: 768Mi
-          securityContext:
-            runAsNonRoot: true
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
 ---
+# NodePort 30080 -> porta 8080 do host (kind)
 apiVersion: v1
 kind: Service
 metadata:
@@ -61,5 +57,5 @@ spec:
   ports:
     - name: http
       port: 8501
-      targetPort: 8501
+      targetPort: http
       nodePort: 30080

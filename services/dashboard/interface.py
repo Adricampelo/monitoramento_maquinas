@@ -10,7 +10,22 @@ import plotly.express as px
 # CONFIGURAÇÃO
 # ============================================================
 
-API_URL = os.getenv("API_URL", "http://api:8000")
+# Formato: "Nome=uuid,Nome=uuid" (vem do ConfigMap no Kubernetes)
+MAQUINAS = dict(
+    item.split("=", 1)
+    for item in os.getenv(
+        "MAQUINAS_DASHBOARD",
+        "Máquina 001=bcb2ade2-946f-4df2-a501-56e41c259cb7,"
+        "Máquina 002=41bdd388-b2c1-4fc4-99eb-8668c4ef5c07",
+    ).split(",")
+)
+
+INTERSCITY_URL = os.getenv(
+    "INTERSCITY_URL",
+    "https://cidadesinteligentes.lsdi.ufma.br/interscity_lh",
+).rstrip("/")
+
+BASE_URL = INTERSCITY_URL + "/collector/resources/{uuid}/data/"
 
 INTERVALO = 30
 LIMITE_ONLINE_MIN = 10
@@ -96,55 +111,87 @@ st.markdown(
 # ============================================================
 
 @st.cache_data(ttl=INTERVALO, show_spinner=False)
-def listar_maquinas():
-    resposta = requests.get(f"{API_URL}/maquinas", timeout=20)
+def consultar_dados(uuid):
+    url = BASE_URL.format(uuid=uuid)
+
+    resposta = requests.get(url, timeout=20)
     resposta.raise_for_status()
 
-    return [m["maquina_id"] for m in resposta.json()["maquinas"]]
+    return resposta.json()
 
 
-@st.cache_data(ttl=INTERVALO, show_spinner=False)
-def consultar_telemetria(maquina_id, horas):
-    """Devolve o histórico em formato longo: Data, Valor, Variável."""
-    parametros = {"horas": horas} if horas else {"horas": 24 * 90}
+def montar_historico(recurso):
+    tabelas = []
 
-    resposta = requests.get(
-        f"{API_URL}/telemetria/{maquina_id}",
-        params=parametros,
-        timeout=20,
+    capacidades = recurso.get("capabilities", {})
+
+    for capacidade, registros in capacidades.items():
+        if not isinstance(registros, list) or not registros:
+            continue
+
+        df = pd.DataFrame(registros)
+
+        coluna_valor = (
+            "value" if "value" in df.columns
+            else capacidade if capacidade in df.columns
+            else None
+        )
+
+        if coluna_valor is None or "date" not in df.columns:
+            continue
+
+        df = df[["date", coluna_valor]].copy()
+        df.columns = ["Data", "Valor"]
+
+        df["Data"] = pd.to_datetime(
+            df["Data"],
+            errors="coerce",
+            utc=True,
+        )
+
+        df["Valor"] = pd.to_numeric(
+            df["Valor"],
+            errors="coerce",
+        )
+
+        df["Variável"] = capacidade
+
+        tabelas.append(df)
+
+    if not tabelas:
+        return pd.DataFrame(
+            columns=["Data", "Valor", "Variável"]
+        )
+
+    historico = pd.concat(tabelas, ignore_index=True)
+
+    historico = historico.dropna(
+        subset=["Data", "Valor"]
     )
 
-    if resposta.status_code == 404:
-        return pd.DataFrame(columns=["Data", "Valor", "Variável"])
+    return historico.sort_values("Data").reset_index(drop=True)
 
-    resposta.raise_for_status()
 
-    dados = resposta.json()["medicoes"]
-    df = pd.DataFrame(dados)
+def buscar_historico(maquina, uuid):
+    dados = consultar_dados(uuid)
 
-    if df.empty:
-        return pd.DataFrame(columns=["Data", "Valor", "Variável"])
+    recursos = dados.get("resources", [])
 
-    colunas = [c for c in ("temp", "vibra") if c in df.columns]
-
-    df = df.melt(
-        id_vars="Data",
-        value_vars=colunas,
-        var_name="Variável",
-        value_name="Valor",
+    recurso = next(
+        (
+            r for r in recursos
+            if r.get("uuid") == uuid
+        ),
+        None,
     )
 
-    df["Data"] = pd.to_datetime(df["Data"], errors="coerce", utc=True)
-    df["Valor"] = pd.to_numeric(df["Valor"], errors="coerce")
+    if recurso is None:
+        return pd.DataFrame(
+            columns=["Data", "Valor", "Variável"]
+        )
 
-    df = df.dropna(subset=["Data", "Valor"])
+    return montar_historico(recurso)
 
-    return df.sort_values("Data").reset_index(drop=True)
-
-
-def horas_do_periodo(periodo_nome):
-    janela = PERIODOS[periodo_nome]
-    return None if janela is None else janela.total_seconds() / 3600
 
 # ============================================================
 # LIMITES E FORMATAÇÃO
@@ -181,24 +228,6 @@ def filtrar_periodo(df, periodo_nome):
 
 
 # ============================================================
-# MÁQUINAS DISPONÍVEIS
-# ============================================================
-
-try:
-    maquinas_disponiveis = listar_maquinas()
-except requests.RequestException as erro:
-    maquinas_disponiveis = []
-    st.error(
-        "Não foi possível consultar a API de telemetria. "
-        "Verifique se o serviço 'api' está de pé."
-    )
-    with st.expander("Detalhes técnicos"):
-        st.code(str(erro))
-
-historicos_possiveis = maquinas_disponiveis
-
-
-# ============================================================
 # BARRA LATERAL
 # ============================================================
 
@@ -215,7 +244,7 @@ with st.sidebar:
 
     maquina_nome = st.selectbox(
         "Máquina",
-        maquinas_disponiveis or ["—"],
+        list(MAQUINAS.keys()),
         disabled=(modo == "Comparar máquinas"),
     )
 
@@ -251,8 +280,7 @@ with st.sidebar:
         use_container_width=True,
         type="primary",
     ):
-        consultar_telemetria.clear()
-        listar_maquinas.clear()
+        consultar_dados.clear()
         st.rerun()
 
     st.caption(
@@ -266,7 +294,7 @@ with st.sidebar:
 
 st.title("Monitoramento Industrial")
 st.caption(
-    "ESP32 → MQTT → PostgreSQL | Acompanhamento de variáveis industriais"
+    "InterSCity | Acompanhamento de variáveis industriais"
 )
 
 st.divider()
@@ -283,15 +311,16 @@ def painel(modo, maquina_nome, periodo_nome, limites_usuario):
         if modo == "Máquina individual":
             maquinas_consultar = [maquina_nome]
         else:
-            maquinas_consultar = list(historicos_possiveis)
+            maquinas_consultar = list(MAQUINAS.keys())
 
         historicos = {}
 
         with st.spinner("Consultando medições..."):
             for nome in maquinas_consultar:
-                historicos[nome] = consultar_telemetria(
+                uuid = MAQUINAS[nome]
+                historicos[nome] = buscar_historico(
                     nome,
-                    horas_do_periodo(periodo_nome),
+                    uuid,
                 )
 
         # --------------------------------------------

@@ -1,100 +1,48 @@
-"""Simulador de ESP32: publica telemetria em MQTT no mesmo contrato do firmware.
+"""Simulador de ESP32: envia leituras ao gateway por HTTP, no mesmo contrato do firmware.
 
-Use antes de ter o hardware na mão — o pipeline inteiro funciona igual.
+    python esp32_sim.py --url http://localhost:8000 --maquinas maq-001 maq-002
 
-    python esp32_sim.py --host localhost --maquinas maq-001 maq-002 --hz 2
+Cada linha mostra qual pod do gateway atendeu (balanceamento do Service).
 """
 
 import argparse
-import json
-import os
 import random
-import signal
-import sys
 import time
 from datetime import datetime, timezone
 
-import paho.mqtt.client as mqtt
-
-
-def agora_iso():
-    """ISO-8601 com milissegundos, como o ESP32 deve publicar."""
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+import requests
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--host", default=os.getenv("MQTT_HOST", "localhost"))
-parser.add_argument("--port", type=int, default=int(os.getenv("MQTT_PORT", "1883")))
-parser.add_argument("--user", default=os.getenv("MQTT_USER", "sensor"))
-parser.add_argument("--senha", default=os.getenv("MQTT_PASS", ""))
+parser.add_argument("--url", default="http://localhost:8000")
 parser.add_argument("--maquinas", nargs="+", default=["maq-001", "maq-002"])
-parser.add_argument("--hz", type=float, default=1.0, help="mensagens por segundo por máquina")
-parser.add_argument("--total", type=int, default=0, help="encerra após N mensagens por máquina (0 = infinito)")
-parser.add_argument("--temp-base", type=float, default=62.0)
-parser.add_argument("--vibra-base", type=float, default=2.4)
-parser.add_argument("--falha", type=float, default=0.0, help="probabilidade de excursão acima do limite")
+parser.add_argument("--intervalo", type=float, default=5.0, help="segundos entre envios")
+parser.add_argument("--falha", type=float, default=0.0, help="probabilidade de valor acima do limite")
 args = parser.parse_args()
 
-rodando = True
-
-
-def parar(*_):
-    global rodando
-    rodando = False
-
-
-signal.signal(signal.SIGINT, parar)
-signal.signal(signal.SIGTERM, parar)
-
-cliente = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"sim-{os.getpid()}")
-cliente.username_pw_set(args.user, args.senha)
-cliente.connect(args.host, args.port, keepalive=30)
-cliente.loop_start()
-
-print(f"publicando em {args.host}:{args.port} | {args.maquinas} @ {args.hz} Hz")
-
-seq = {m: 0 for m in args.maquinas}
-intervalo = 1.0 / args.hz if args.hz > 0 else 1.0
-proxima = time.monotonic()
+print(f"enviando para {args.url}/telemetria | {args.maquinas} a cada {args.intervalo}s")
 
 try:
-    while rodando:
+    while True:
         for maquina in args.maquinas:
-            seq[maquina] += 1
             excursao = random.random() < args.falha
-            temp = args.temp_base + random.gauss(0, 1.2) + (25 if excursao else 0)
-            vibra = args.vibra_base + random.gauss(0, 0.25) + (6 if excursao else 0)
-
-            payload = {
+            leitura = {
                 "maquina_id": maquina,
-                "seq": seq[maquina],
-                "ts": agora_iso(),
-                "temp": round(temp, 2),
-                "vibra": round(vibra, 2),
-                "fw": "sim-1.0",
+                "temp": round(62 + random.gauss(0, 1.2) + (25 if excursao else 0), 2),
+                "vibra": round(2.4 + random.gauss(0, 0.25) + (6 if excursao else 0), 2),
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
-            info = cliente.publish(
-                f"maquinas/{maquina}/telemetria",
-                json.dumps(payload),
-                qos=1,
-            )
-            if seq[maquina] % 30 == 0:
-                info.wait_for_publish(timeout=2)
-                print(f"{maquina} seq={seq[maquina]} temp={temp:.1f} vibra={vibra:.2f}")
-
-        if args.total and all(seq[m] >= args.total for m in args.maquinas):
-            print(f"total atingido: {args.total} por máquina")
-            break
-
-        proxima += intervalo
-        espera = proxima - time.monotonic()
-        if espera > 0:
-            time.sleep(espera)
-        else:
-            proxima = time.monotonic()
-
-except Exception as erro:  # noqa: BLE001
-    print(f"erro: {erro}", file=sys.stderr)
-finally:
-    cliente.loop_stop()
-    cliente.disconnect()
+            # tenta de novo se o gateway estiver fora (ex.: pod reiniciando)
+            for tentativa in range(5):
+                try:
+                    r = requests.post(f"{args.url}/telemetria", json=leitura, timeout=15)
+                    if r.ok:
+                        print(f"ok    {maquina} temp={leitura['temp']} "
+                              f"vibra={leitura['vibra']} pod={r.json()['pod']}")
+                        break
+                    print(f"erro  {maquina} HTTP {r.status_code}: {r.text[:120]}")
+                except requests.RequestException as erro:
+                    print(f"falha {maquina} ({erro.__class__.__name__}), tentando de novo")
+                time.sleep(1 + tentativa)
+        time.sleep(args.intervalo)
+except KeyboardInterrupt:
     print("encerrado")
