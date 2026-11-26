@@ -1,0 +1,42 @@
+# InterSCity falso para testes de carga. Fica fora de k8s/ de propósito:
+# o `make deploy` não o aplica. Use `make teste-preparar`.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-interscity
+  namespace: monitoramento
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-interscity
+  template:
+    metadata:
+      labels:
+        app: mock-interscity
+    spec:
+      containers:
+        - name: mock
+          image: monitoramento/mock-interscity:0.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: LATENCIA_MS
+              value: "200"
+          resources:
+            requests:
+              cpu: 200m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-interscity
+  namespace: monitoramento
+spec:
+  selector:
+    app: mock-interscity
+  ports:
+    - port: 8000
+      targetPort: 8000

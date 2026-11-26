@@ -50,7 +50,7 @@ spec:
             periodSeconds: 10
           resources:
             requests:
-              cpu: 50m
+              cpu: 100m      # base do cálculo de % do HPA
               memory: 64Mi
             limits:
               memory: 256Mi
@@ -89,4 +89,12 @@ spec:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 70
+          # Com o gateway assíncrono a CPU passa a acompanhar a carga
+          # (o processo não fica parado esperando threads). Alvo mais baixo
+          # para escalar antes de a latência subir.
+          averageUtilization: 50
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+    scaleDown:
+      stabilizationWindowSeconds: 120

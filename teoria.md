@@ -132,15 +132,17 @@ aparece no dashboard pouco depois: o modelo é de **consistência eventual**.
   Aqui, cada máquina industrial é um recurso.
 - **UUID**: identificador universal único do recurso. É **nomeação** no sentido
   de sistemas distribuídos: um nome global que independe de onde o recurso está.
-- **Capability**: um tipo de dado que o recurso oferece. Aqui são `temp` e `vibra`.
+- **Capability**: um tipo de dado que o recurso oferece. Aqui são `temperatura` e
+  `vibração`, os nomes cadastrados no Catalog. O dispositivo manda `temp` e
+  `vibra`, e o gateway traduz para esses nomes.
 
 Formato que o gateway envia ao Adaptor:
 
 ```json
 {
   "data": {
-    "temp":  [{ "value": 61.2, "timestamp": "2026-11-23T18:42:11+00:00" }],
-    "vibra": [{ "value": 2.3,  "timestamp": "2026-11-23T18:42:11+00:00" }]
+    "temperatura": [{ "value": 61.2, "timestamp": "2026-11-23T18:42:11+00:00" }],
+    "vibração":    [{ "value": 2.3,  "timestamp": "2026-11-23T18:42:11+00:00" }]
   }
 }
 ```
@@ -366,12 +368,12 @@ verdade, só que rodando numa máquina só.
 |---|---|---|
 | **Namespace** | Isolamento lógico dentro do cluster | `monitoramento` agrupa todos os recursos do projeto |
 | **Pod** | Menor unidade de execução: um ou mais contêineres com o mesmo IP. É efêmero. | Cada réplica do gateway e do dashboard é um pod |
-| **Deployment** | Controlador que mantém N réplicas idênticas e faz atualizações | `gateway` (2 réplicas) e `dashboard` (1 réplica) |
+| **Deployment** | Controlador que mantém N réplicas idênticas e faz atualizações | `gateway` (2 réplicas) e `dashboard` (2 réplicas, com afinidade de sessão) |
 | **ReplicaSet** | Criado pelo Deployment; é quem garante o número de pods | Criado automaticamente |
 | **Service** | IP e nome DNS **estáveis** para um grupo de pods, que mudam de IP o tempo todo. Faz **balanceamento de carga**. | `gateway` e `dashboard` |
 | **NodePort** | Tipo de Service que expõe uma porta em cada nó para acesso de fora do cluster | 30000 (gateway) e 30080 (dashboard), mapeadas para 8000 e 8080 do host pelo kind |
 | **ConfigMap** | Configuração separada da imagem (princípio *12-factor*) | URL do InterSCity e mapas de máquinas, injetados como variáveis de ambiente via `envFrom` |
-| **HPA** | Autoescalonamento horizontal por métrica | Gateway entre 2 e 5 réplicas, mirando 70% de CPU |
+| **HPA** | Autoescalonamento horizontal por métrica | Gateway entre 2 e 5 réplicas (alvo 50% de CPU); dashboard entre 2 e 4 |
 
 ### 9.4 Service: descoberta e balanceamento
 
@@ -508,7 +510,7 @@ Reconhecer limitações demonstra domínio do assunto. Estas são as do projeto:
 | **Perda de dados se tudo cair por muito tempo** | Sem broker ou fila, a ESP32 desiste após 3 tentativas | Buffer na flash da ESP32, ou voltar a usar MQTT com broker |
 | **Sem autenticação no gateway** | Simplificação para a demonstração | Token por dispositivo (header) ou mTLS |
 | **HTTP sem TLS entre ESP32 e gateway** | Rede local, e TLS é custoso no microcontrolador | TLS com certificado no gateway (Ingress) |
-| **Dashboard com 1 réplica** | Streamlit guarda sessão em memória (stateful) | Mais réplicas com *session affinity* no Service |
+| **Afinidade de sessão no dashboard** | Streamlit guarda a sessão em memória (stateful); se o pod do usuário cair, a sessão dele recomeça em outro pod | Aceitável para um painel; para evitar, guardar o estado da sessão fora do pod |
 | **Cluster numa máquina só (kind)** | Ambiente de laboratório | O mesmo YAML roda em cluster real (GKE, EKS, k3s em várias máquinas) |
 
 ---
@@ -561,9 +563,11 @@ Simplicidade: um componente a menos e o mesmo protocolo de ponta a ponta. O
 MQTT valeria a pena com muitos dispositivos ou rede instável, por causa do
 broker que guarda as mensagens.
 
-**Por que o gateway escala e o dashboard não?**
-O gateway é stateless. O Streamlit mantém a sessão do usuário na memória do
-pod, então escalar exigiria afinidade de sessão.
+**Como o dashboard escala, se o Streamlit guarda estado?**
+O Streamlit mantém a sessão do usuário na memória do pod. Por isso o Service do
+dashboard usa `sessionAffinity: ClientIP`: cada usuário fica sempre no mesmo pod,
+e novos usuários se distribuem entre as réplicas. O gateway não precisa disso
+porque é stateless.
 
 **O que é o laço de reconciliação?**
 Os controladores do Kubernetes comparam continuamente o estado desejado (o
@@ -586,7 +590,7 @@ escrita.
 | Termo | Significado |
 |---|---|
 | **Backoff** | Esperar cada vez mais entre tentativas |
-| **Capability** | Tipo de dado que um recurso do InterSCity oferece (ex.: `temp`) |
+| **Capability** | Tipo de dado que um recurso do InterSCity oferece (ex.: `temperatura`) |
 | **ConfigMap** | Objeto do Kubernetes com configuração em chave-valor |
 | **Deployment** | Controlador que mantém N réplicas de um pod e faz atualizações |
 | **HPA** | Escala o número de pods automaticamente por métrica |

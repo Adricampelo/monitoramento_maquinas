@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 credenciais.env
 sim*.log
+.venv-testes/
+testes/resultado-*.json
+testes/recursos-teste.env

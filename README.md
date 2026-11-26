@@ -19,7 +19,7 @@ ESP32 / simulador ──HTTP POST──► Service "gateway" ──► gateway (
 |---|---|
 | **ESP32** ([esp32/monitoramento.ino](esp32/monitoramento.ino)) | Lê os sensores e faz `POST /telemetria` no gateway. Se falhar, tenta de novo. |
 | **Simulador** ([simulador/esp32_sim.py](simulador/esp32_sim.py)) | Faz o papel da ESP32 quando não há hardware. |
-| **Gateway** ([services/gateway/gateway.py](services/gateway/gateway.py)) | Recebe a leitura, traduz `maquina_id` para o `uuid` do recurso no InterSCity e envia ao **Resource Adaptor** (`POST /adaptor/resources/{uuid}/data`). Não guarda estado, então qualquer réplica atende qualquer requisição. |
+| **Gateway** ([services/gateway/gateway.py](services/gateway/gateway.py)) | Recebe a leitura, traduz `maquina_id` para o `uuid` do recurso no InterSCity e envia ao **Resource Adaptor** (`POST /adaptor/resources/{uuid}/data`). Não guarda estado, então qualquer réplica atende qualquer requisição. É assíncrono (`aiohttp`): um pod mantém centenas de envios em andamento. |
 | **Dashboard** ([services/dashboard/interface.py](services/dashboard/interface.py)) | Lê o histórico no **Data Collector** do InterSCity (`GET /collector/resources/{uuid}/data`) e mostra gráficos, alertas e exportação em CSV. |
 | **InterSCity** | Middleware de cidades inteligentes da UFMA. Guarda os recursos e as medições. |
 
@@ -28,8 +28,8 @@ ESP32 / simulador ──HTTP POST──► Service "gateway" ──► gateway (
 - **ConfigMap** `interscity`: URL do InterSCity e o mapa máquina → uuid. Para mudar, basta editar sem rebuild.
 - **Deployment** `gateway` com 2 réplicas espalhadas entre os nós, probes de liveness/readiness e rolling update com `maxUnavailable: 0`.
 - **Service** `gateway` (NodePort): balanceia as requisições entre as réplicas.
-- **HPA**: escala o gateway de 2 a 5 réplicas conforme a CPU.
-- **Deployment + Service** `dashboard`.
+- **HPA**: escala o gateway de 2 a 5 réplicas (alvo de 50% de CPU) e o dashboard de 2 a 4.
+- **Deployment + Service** `dashboard` com 2 réplicas e `sessionAffinity: ClientIP` (o Streamlit guarda a sessão na memória do pod, então cada usuário fica sempre no mesmo pod).
 
 ### Comportamento em falhas
 
@@ -87,9 +87,48 @@ Em [esp32/monitoramento.ino](esp32/monitoramento.ino), ajuste o Wi-Fi e `GATEWAY
 com o IP do computador que roda o cluster (porta 8000). O `MAQUINA_ID` precisa
 estar cadastrado no ConfigMap.
 
+### Testes de carga
+
+Para medir quantos envios e quantos usuários o sistema aguenta, contra um InterSCity
+falso (para não sobrecarregar o servidor da UFMA), siga o
+[plano de testes](testes/PLANO_DE_TESTES.md):
+
+```bash
+make teste-preparar      # sobe o InterSCity falso e aponta os serviços para ele
+make teste-gateway       # k6: envios por segundo
+make teste-dashboard     # Playwright: usuários simultâneos
+make teste-restaurar     # volta para o InterSCity real
+```
+
+#### Testes com o InterSCity real
+
+Estes testes gravam leituras de verdade no servidor da UFMA. Rode `make teste-restaurar`
+antes, caso tenha usado o InterSCity falso.
+
+**Carga leve** (até 20 req/s, cerca de 100 ESP32, com freio automático):
+
+```bash
+make teste-real
+```
+
+**Teste autorizado** (até 1000 req/s, cerca de 5000 ESP32, ~9 min), autorizado pelo LSDi/UFMA:
+
+```bash
+make teste-recursos               # cria os recursos de teste no Catalog (uma vez só)
+make teste-autorizado-preparar    # 4+ réplicas do gateway; deve terminar com HTTP 201
+make teste-monitorar              # em outro terminal: HPA, CPU e pods ao vivo
+make teste-autorizado             # dispara (digite SIM para confirmar)
+make teste-autorizado-restaurar   # volta o gateway ao normal (HPA 2–5)
+```
+
+O teste para sozinho se o erro passar de 2% ou o p95 passar de 2 s, e o Ctrl+C
+interrompe a qualquer momento. Para saber se o gargalo foi o InterSCity ou a sua
+máquina, observe a CPU dos pods do gateway no `teste-monitorar` **durante** a carga.
+Detalhes e resultados na seção 9 do [plano de testes](testes/PLANO_DE_TESTES.md).
+
 ### Cadastrar outra máquina
 
-1. Crie o recurso no InterSCity (Catalog) com as capabilities `temp` e `vibra` e anote o `uuid`.
+1. Crie o recurso no InterSCity (Catalog) com as capabilities `temperatura` e `vibração` e anote o `uuid`.
 2. Acrescente `maq-xxx=<uuid>` em `MAQUINAS` e `Nome=<uuid>` em `MAQUINAS_DASHBOARD`, no arquivo [k8s/00-namespace-config.yaml](k8s/00-namespace-config.yaml).
 3. Rode `make deploy && kubectl -n monitoramento rollout restart deployment/gateway deployment/dashboard`.
 
@@ -112,6 +151,7 @@ make down
 ├── services/
 │   ├── gateway/               FastAPI: dispositivo → InterSCity
 │   └── dashboard/             Streamlit: InterSCity → gráficos
+├── testes/                    plano, scripts de carga e InterSCity falso
 ├── simulador/esp32_sim.py
 └── esp32/monitoramento.ino
 ```

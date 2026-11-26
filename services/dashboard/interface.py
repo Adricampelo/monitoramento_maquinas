@@ -1,5 +1,7 @@
 
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import pandas as pd
@@ -25,19 +27,38 @@ INTERSCITY_URL = os.getenv(
     "https://cidadesinteligentes.lsdi.ufma.br/interscity_lh",
 ).rstrip("/")
 
-BASE_URL = INTERSCITY_URL + "/collector/resources/{uuid}/data/"
+BASE_URL = INTERSCITY_URL + "/collector/resources/{uuid}/data"
+
+# O Collector devolve no máximo 1000 registros por consulta (somando todas as
+# capabilities). Quando uma janela de tempo bate nesse teto, ela é dividida ao
+# meio e consultada de novo, até cada pedaço caber numa resposta.
+TETO_COLLECTOR = 1000
+
+# Início do histórico usado no período "Tudo"
+HISTORICO_DESDE = pd.Timestamp(os.getenv("HISTORICO_DESDE", "2026-01-01"), tz="UTC")
+
+# Janela mínima consultada, para o status (última medição) continuar correto
+# mesmo quando o período exibido é curto
+JANELA_MINIMA = pd.Timedelta(days=7)
+
+# Nomes antigos enviados pelo gateway -> nomes cadastrados no Catalog.
+# O histórico fica numa série só, qualquer que seja o nome usado no envio.
+SINONIMOS = {
+    "temp": "temperatura",
+    "vibra": "vibração",
+}
 
 INTERVALO = 30
 LIMITE_ONLINE_MIN = 10
 FUSO = "America/Fortaleza"
 
 LIMITES = {
-    "temp": {
+    "temperatura": {
         "rotulo": "Temperatura",
         "unidade": "°C",
         "padrao": 80.0,
     },
-    "vibra": {
+    "vibração": {
         "rotulo": "Vibração",
         "unidade": "mm/s",
         "padrao": 7.0,
@@ -125,14 +146,92 @@ st.markdown(
 # CONSULTA À API
 # ============================================================
 
-@st.cache_data(ttl=INTERVALO, show_spinner=False)
-def consultar_dados(uuid):
-    url = BASE_URL.format(uuid=uuid)
+def _data_iso(ts):
+    return ts.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ts.microsecond // 1000:03d}Z"
 
-    resposta = requests.get(url, timeout=20)
+
+def _consultar_janela(uuid, inicio, fim):
+    """Uma consulta ao Collector. Devolve (capabilities, total de registros).
+
+    O servidor às vezes responde 503 passageiro: tenta até 4 vezes, com
+    espera crescente, antes de desistir.
+    """
+    for tentativa in range(4):
+        try:
+            resposta = requests.get(
+                BASE_URL.format(uuid=uuid),
+                params={"start_date": _data_iso(inicio), "end_date": _data_iso(fim)},
+                timeout=20,
+            )
+            if resposta.status_code < 500:
+                break
+        except (requests.ConnectionError, requests.Timeout):
+            if tentativa == 3:
+                raise
+        time.sleep(0.5 * 2 ** tentativa)  # 0,5 s, 1 s, 2 s
     resposta.raise_for_status()
 
-    return resposta.json()
+    recurso = next(
+        (r for r in resposta.json().get("resources", []) if r.get("uuid") == uuid),
+        {},
+    )
+    capacidades = recurso.get("capabilities", {}) or {}
+    total = sum(len(v) for v in capacidades.values() if isinstance(v, list))
+    return capacidades, total
+
+
+def _consultar_paginado(uuid, inicio, fim, profundidade=0):
+    """Busca [inicio, fim] dividindo a janela ao meio sempre que bater no teto."""
+    capacidades, total = _consultar_janela(uuid, inicio, fim)
+
+    if total < TETO_COLLECTOR or fim - inicio <= pd.Timedelta(seconds=1) or profundidade > 30:
+        return [capacidades]
+
+    meio = inicio + (fim - inicio) / 2
+    # end_date é inclusivo: a segunda metade começa 1 ms depois do meio
+    return (
+        _consultar_paginado(uuid, inicio, meio, profundidade + 1)
+        + _consultar_paginado(uuid, meio + pd.Timedelta(milliseconds=1), fim, profundidade + 1)
+    )
+
+
+@st.cache_data(ttl=INTERVALO, show_spinner=False)
+def consultar_dados(uuid, periodo_nome):
+    """Histórico completo do período, juntando todas as páginas."""
+    agora = pd.Timestamp.now(tz="UTC")
+    janela = PERIODOS[periodo_nome]
+
+    if janela is None:
+        inicio = HISTORICO_DESDE
+    else:
+        inicio = agora - max(janela, JANELA_MINIMA)
+
+    # 1 dia à frente: tolera relógio adiantado no dispositivo
+    fim = agora + pd.Timedelta(days=1)
+
+    # A janela inicial é dividida em 8 partes consultadas em paralelo
+    passo = (fim - inicio) / 8
+    partes = [
+        (inicio + passo * i + (pd.Timedelta(milliseconds=1) if i else pd.Timedelta(0)),
+         inicio + passo * (i + 1))
+        for i in range(8)
+    ]
+    # paralelismo baixo de propósito: o servidor é compartilhado
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        paginas = [
+            pagina
+            for resultado in pool.map(lambda p: _consultar_paginado(uuid, *p), partes)
+            for pagina in resultado
+        ]
+
+    # junta as páginas numa estrutura igual à resposta original
+    capacidades = {}
+    for pagina in paginas:
+        for nome, registros in pagina.items():
+            if isinstance(registros, list):
+                capacidades.setdefault(nome, []).extend(registros)
+
+    return {"resources": [{"uuid": uuid, "capabilities": capacidades}]}
 
 
 def montar_historico(recurso):
@@ -146,17 +245,26 @@ def montar_historico(recurso):
 
         df = pd.DataFrame(registros)
 
-        coluna_valor = (
-            "value" if "value" in df.columns
-            else capacidade if capacidade in df.columns
-            else None
-        )
-
-        if coluna_valor is None or "date" not in df.columns:
+        if "date" not in df.columns:
             continue
 
-        df = df[["date", coluna_valor]].copy()
-        df.columns = ["Data", "Valor"]
+        # O valor costuma vir em "value", mas registros antigos usam outros
+        # nomes (ex.: "temperature"). Usa o primeiro campo preenchido,
+        # dando preferência a "value" e ao nome da capability.
+        candidatas = ["value", capacidade] + [
+            c for c in df.columns if c not in ("value", capacidade, "date")
+        ]
+        candidatas = [c for c in candidatas if c in df.columns]
+
+        if not candidatas:
+            continue
+
+        valores = df[candidatas].apply(pd.to_numeric, errors="coerce")
+
+        df = pd.DataFrame({
+            "Data": df["date"],
+            "Valor": valores.bfill(axis=1).iloc[:, 0],
+        })
 
         df["Data"] = pd.to_datetime(
             df["Data"],
@@ -169,7 +277,7 @@ def montar_historico(recurso):
             errors="coerce",
         )
 
-        df["Variável"] = capacidade
+        df["Variável"] = SINONIMOS.get(capacidade, capacidade)
 
         tabelas.append(df)
 
@@ -184,11 +292,16 @@ def montar_historico(recurso):
         subset=["Data", "Valor"]
     )
 
+    # páginas vizinhas podem repetir registros na borda
+    historico = historico.drop_duplicates(
+        subset=["Data", "Valor", "Variável"]
+    )
+
     return historico.sort_values("Data").reset_index(drop=True)
 
 
-def buscar_historico(maquina, uuid):
-    dados = consultar_dados(uuid)
+def buscar_historico(maquina, uuid, periodo_nome):
+    dados = consultar_dados(uuid, periodo_nome)
 
     recursos = dados.get("resources", [])
 
@@ -336,6 +449,7 @@ def painel(modo, maquina_nome, periodo_nome, limites_usuario):
                 historicos[nome] = buscar_historico(
                     nome,
                     uuid,
+                    periodo_nome,
                 )
 
         # --------------------------------------------

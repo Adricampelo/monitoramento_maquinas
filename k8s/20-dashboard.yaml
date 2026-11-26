@@ -6,7 +6,7 @@ metadata:
   labels:
     app: dashboard
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: dashboard
@@ -15,6 +15,13 @@ spec:
       labels:
         app: dashboard
     spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: dashboard
       containers:
         - name: dashboard
           image: monitoramento/dashboard:0.1
@@ -44,7 +51,9 @@ spec:
             limits:
               memory: 768Mi
 ---
-# NodePort 30080 -> porta 8080 do host (kind)
+# NodePort 30080 -> porta 8080 do host (kind).
+# O Streamlit guarda a sessão do usuário na memória do pod; a afinidade
+# por IP mantém cada usuário sempre no mesmo pod.
 apiVersion: v1
 kind: Service
 metadata:
@@ -52,6 +61,10 @@ metadata:
   namespace: monitoramento
 spec:
   type: NodePort
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
   selector:
     app: dashboard
   ports:
@@ -59,3 +72,23 @@ spec:
       port: 8501
       targetPort: http
       nodePort: 30080
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: dashboard
+  namespace: monitoramento
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: dashboard
+  minReplicas: 2
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
