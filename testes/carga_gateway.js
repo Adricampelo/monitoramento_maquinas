@@ -113,6 +113,8 @@ export default function () {
     vibra: 2 + Math.random(),
   }), { headers: { "Content-Type": "application/json" }, timeout: "15s" });
 
-  check(r, { "201": (x) => x.status === 201 });
-  if (r.status === 201) porPod.add(1, { pod: r.json("pod") });
+  // 202 = aceito na fila (gateway com NATS); 201 = versão síncrona antiga
+  const ok = r.status === 202 || r.status === 201;
+  check(r, { "aceito (202)": () => ok });
+  if (ok) porPod.add(1, { pod: r.json("pod") });
 }

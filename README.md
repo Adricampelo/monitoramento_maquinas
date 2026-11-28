@@ -2,33 +2,46 @@
 
 Sistema distribuído que coleta temperatura e vibração de máquinas industriais,
 envia os dados à plataforma **InterSCity** por meio de um **gateway IoT** e os
-exibe num dashboard. O gateway e o dashboard rodam num cluster **Kubernetes**.
+exibe num dashboard. Gateway, fila (NATS JetStream), encaminhador e dashboard
+rodam num cluster **Kubernetes**.
 
 ## Arquitetura
 
 ```
-ESP32 / simulador ──HTTP POST──► Service "gateway" ──► gateway (2+ réplicas) ──► InterSCity
-                                  (balanceamento)                                /adaptor
-                                                                                    │
-            navegador ◄── dashboard (Streamlit) ◄── InterSCity /collector ◄─────────┘
+ESP32 / simulador ──POST──► gateway (2–8) ──► NATS JetStream ──► encaminhador (2–6) ──► InterSCity
+                    202 ◄── valida e grava     3 nós, stream R3    agrupa por máquina,      /adaptor
+                            na fila            (fila durável)      1 POST por lote             │
+                                                                                               │
+            navegador ◄── dashboard (Streamlit) ◄── InterSCity /collector ◄────────────────────┘
 
-                        └──────────── cluster Kubernetes (kind) ────────────┘
+                        └──────────────── cluster Kubernetes (kind) ────────────────┘
 ```
+
+O gateway responde assim que a leitura está gravada na fila, sem esperar o
+InterSCity. Por isso a latência do dispositivo não depende do servidor externo,
+e uma lentidão ou queda do InterSCity só faz a fila crescer: nada se perde e
+nada volta como erro ao ESP32. O `202` quer dizer "aceito", não "gravado no
+InterSCity" (consistência eventual).
 
 | Componente | O que faz |
 |---|---|
 | **ESP32** ([esp32/monitoramento.ino](esp32/monitoramento.ino)) | Lê os sensores e faz `POST /telemetria` no gateway. Se falhar, tenta de novo. |
 | **Simulador** ([simulador/esp32_sim.py](simulador/esp32_sim.py)) | Faz o papel da ESP32 quando não há hardware. |
-| **Gateway** ([services/gateway/gateway.py](services/gateway/gateway.py)) | Recebe a leitura, traduz `maquina_id` para o `uuid` do recurso no InterSCity e envia ao **Resource Adaptor** (`POST /adaptor/resources/{uuid}/data`). Não guarda estado, então qualquer réplica atende qualquer requisição. É assíncrono (`aiohttp`): um pod mantém centenas de envios em andamento. |
+| **Gateway** ([services/gateway/gateway.py](services/gateway/gateway.py)) | Recebe a leitura, confere se a máquina está cadastrada, publica no stream `TELEMETRIA` do NATS e responde `202` quando a maioria das réplicas do stream confirmou a gravação. Fila cheia ou sem quórum: `503` e o dispositivo reenvia. Não guarda estado. |
+| **NATS JetStream** ([k8s/05-nats.yaml](k8s/05-nats.yaml)) | Fila durável em cluster de 3 servidores (Raft). O stream é replicado nos 3 (R3) e em modo *work queue*: a leitura sai da fila quando o encaminhador confirma a entrega. |
+| **Encaminhador** ([services/encaminhador/encaminhador.py](services/encaminhador/encaminhador.py)) | Consome a fila em lote (janela de 1 s), agrupa por `uuid` e faz **um** `POST /adaptor/resources/{uuid}/data` com até 500 leituras. Limita os POSTs simultâneos (`MAX_EM_VOO`) para proteger o InterSCity. Se o POST falhar, as leituras voltam à fila e são reentregues (entrega "pelo menos uma vez"). |
 | **Dashboard** ([services/dashboard/interface.py](services/dashboard/interface.py)) | Lê o histórico no **Data Collector** do InterSCity (`GET /collector/resources/{uuid}/data`) e mostra gráficos, alertas e exportação em CSV. |
 | **InterSCity** | Middleware de cidades inteligentes da UFMA. Guarda os recursos e as medições. |
 
 ### Recursos de Kubernetes usados ([k8s/](k8s/))
 
 - **ConfigMap** `interscity`: URL do InterSCity e o mapa máquina → uuid. Para mudar, basta editar sem rebuild.
+- **StatefulSet** `nats` com 3 réplicas, volume persistente por réplica e Service headless (endereço estável de cada servidor do cluster).
 - **Deployment** `gateway` com 2 réplicas espalhadas entre os nós, probes de liveness/readiness e rolling update com `maxUnavailable: 0`.
 - **Service** `gateway` (NodePort): balanceia as requisições entre as réplicas.
-- **HPA**: escala o gateway de 2 a 5 réplicas (alvo de 50% de CPU) e o dashboard de 2 a 4.
+- **Deployment** `encaminhador`: várias réplicas dividem o mesmo consumidor durável, então cada leitura vai a uma só réplica.
+- **HPA**: escala o gateway de 2 a 8 réplicas (alvo de 50% de CPU) e o dashboard de 2 a 4.
+- **KEDA ScaledObject**: escala o encaminhador de 2 a 6 réplicas pelo **tamanho da fila**, e não por CPU. O encaminhador passa o tempo esperando o InterSCity, então a CPU dele não mostra o atraso.
 - **Deployment + Service** `dashboard` com 2 réplicas e `sessionAffinity: ClientIP` (o Streamlit guarda a sessão na memória do pod, então cada usuário fica sempre no mesmo pod).
 
 ### Comportamento em falhas
@@ -36,9 +49,11 @@ ESP32 / simulador ──HTTP POST──► Service "gateway" ──► gateway (
 | Falha | O que acontece |
 |---|---|
 | Um pod do gateway morre | O Service passa a mandar tudo para a outra réplica e o Deployment recria o pod. |
-| InterSCity fora do ar | O gateway tenta 3 vezes e responde `502`. O dispositivo reenvia depois. |
+| Um servidor do NATS cai | Os outros 2 mantêm o quórum e o stream R3 continua aceitando e entregando. |
+| Um encaminhador cai no meio de um lote | As leituras sem confirmação voltam à fila após 60 s e outra réplica as entrega (podem ficar duplicadas no InterSCity). |
+| InterSCity lento ou fora do ar | A fila cresce, o gateway continua respondendo `202` e o encaminhador reenvia com atraso. Só com a fila cheia (1 GB) o gateway responde `503`. |
 | Atualização de versão | O rolling update sobe o pod novo antes de derrubar o antigo, sem interromper o serviço. |
-| Carga alta | O HPA cria mais réplicas do gateway. |
+| Carga alta | O HPA cria mais gateways (CPU) e o KEDA cria mais encaminhadores (fila). |
 
 ## Como rodar
 
@@ -49,7 +64,7 @@ Docker, [`kind`](https://kind.sigs.k8s.io/), `kubectl` e Python 3.10+ (para o si
 ### Passo a passo
 
 ```bash
-make cluster                      # cluster de 3 nós + metrics-server (~1 min)
+make cluster                      # cluster de 3 nós + metrics-server + KEDA (~2 min)
 make up                           # build das imagens, carga no kind e kubectl apply
 make sim                          # simulador enviando ao gateway (cria o .venv na 1ª vez)
 ```
@@ -115,22 +130,23 @@ make teste-real
 
 ```bash
 make teste-recursos               # cria os recursos de teste no Catalog (uma vez só)
-make teste-autorizado-preparar    # 4+ réplicas do gateway; deve terminar com HTTP 201
-make teste-monitorar              # em outro terminal: HPA, CPU e pods ao vivo
+make teste-autorizado-preparar    # 4+ réplicas do gateway; deve terminar com HTTP 202
+make teste-monitorar              # em outro terminal: fila, réplicas, CPU (grava CSV)
 make teste-autorizado             # dispara (digite SIM para confirmar)
-make teste-autorizado-restaurar   # volta o gateway ao normal (HPA 2–5)
+make teste-autorizado-restaurar   # volta ao normal (HPA do gateway 2–8)
 ```
 
 O teste para sozinho se o erro passar de 2% ou o p95 passar de 2 s, e o Ctrl+C
-interrompe a qualquer momento. Para saber se o gargalo foi o InterSCity ou a sua
-máquina, observe a CPU dos pods do gateway no `teste-monitorar` **durante** a carga.
-Detalhes e resultados na seção 9 do [plano de testes](testes/PLANO_DE_TESTES.md).
+interrompe a qualquer momento. Como o gateway responde ao gravar na fila, o k6
+mede a **recepção**. A **entrega** se vê no `teste-monitorar` (`entregues_por_s`
+e `fila_pendente`): o sistema acompanha a carga se a fila não cresce sem parar.
+Resultado do último teste em [testes/RELATORIO_TESTE_AUTORIZADO.md](testes/RELATORIO_TESTE_AUTORIZADO.md).
 
 ### Cadastrar outra máquina
 
 1. Crie o recurso no InterSCity (Catalog) com as capabilities `temperatura` e `vibração` e anote o `uuid`.
 2. Acrescente `maq-xxx=<uuid>` em `MAQUINAS` e `Nome=<uuid>` em `MAQUINAS_DASHBOARD`, no arquivo [k8s/00-namespace-config.yaml](k8s/00-namespace-config.yaml).
-3. Rode `make deploy && kubectl -n monitoramento rollout restart deployment/gateway deployment/dashboard`.
+3. Rode `make deploy && kubectl -n monitoramento rollout restart deployment/gateway deployment/encaminhador deployment/dashboard`.
 
 ### Encerrar
 
@@ -146,10 +162,13 @@ make down
 ├── drill-gateway.sh           teste de falha: mata um pod do gateway
 ├── k8s/
 │   ├── 00-namespace-config.yaml
+│   ├── 05-nats.yaml           StatefulSet do NATS JetStream (3 nós)
 │   ├── 10-gateway.yaml        Deployment + Service + HPA
+│   ├── 15-encaminhador.yaml   Deployment + ScaledObject (KEDA)
 │   └── 20-dashboard.yaml      Deployment + Service
 ├── services/
-│   ├── gateway/               FastAPI: dispositivo → InterSCity
+│   ├── gateway/               FastAPI: dispositivo → fila
+│   ├── encaminhador/          fila → InterSCity, em lote
 │   └── dashboard/             Streamlit: InterSCity → gráficos
 ├── testes/                    plano, scripts de carga e InterSCity falso
 ├── simulador/esp32_sim.py
@@ -158,4 +177,4 @@ make down
 
 ## Tecnologias
 
-Python, FastAPI, Streamlit, Pandas, Plotly, Docker, Kubernetes (kind), InterSCity, ESP32.
+Python, FastAPI, NATS JetStream, KEDA, Streamlit, Pandas, Plotly, Docker, Kubernetes (kind), InterSCity, ESP32.

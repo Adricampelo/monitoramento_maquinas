@@ -37,6 +37,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: interscity
+          env:
+            - { name: NATS_URL, value: "nats://nats:4222" }
           readinessProbe:
             httpGet:
               path: /healthz
@@ -50,7 +52,7 @@ spec:
             periodSeconds: 10
           resources:
             requests:
-              cpu: 100m      # base do cálculo de % do HPA
+              cpu: 250m      # base do cálculo de % do HPA
               memory: 64Mi
             limits:
               memory: 256Mi
@@ -82,16 +84,15 @@ spec:
     kind: Deployment
     name: gateway
   minReplicas: 2
-  maxReplicas: 5
+  maxReplicas: 8
   metrics:
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
-          # Com o gateway assíncrono a CPU passa a acompanhar a carga
-          # (o processo não fica parado esperando threads). Alvo mais baixo
-          # para escalar antes de a latência subir.
+          # O gateway só valida e grava na fila (não espera o InterSCity),
+          # então o trabalho dele é CPU e a CPU acompanha a carga.
           averageUtilization: 50
   behavior:
     scaleUp:

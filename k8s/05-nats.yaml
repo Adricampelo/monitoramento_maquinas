@@ -1,0 +1,128 @@
+# NATS JetStream: fila durável entre o gateway e o encaminhador.
+# 3 servidores em cluster (consenso Raft). O stream TELEMETRIA é replicado
+# nos 3 (R3), então a fila continua aceitando e entregando se 1 nó cair.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-config
+  namespace: monitoramento
+data:
+  nats.conf: |
+    server_name: $POD_NAME
+    listen: 0.0.0.0:4222
+    http: 0.0.0.0:8222
+    max_payload: 1MB
+    jetstream {
+      store_dir: /data
+      max_memory_store: 256MB
+      max_file_store: 2GB
+    }
+    cluster {
+      name: nats
+      listen: 0.0.0.0:6222
+      routes: [
+        nats://nats-0.nats-headless:6222
+        nats://nats-1.nats-headless:6222
+        nats://nats-2.nats-headless:6222
+      ]
+    }
+---
+# Endereço estável de cada servidor (nats-0.nats-headless, ...) para o cluster
+# e para o KEDA consultar o líder do consumidor.
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats-headless
+  namespace: monitoramento
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: nats
+  ports:
+    - { name: client, port: 4222 }
+    - { name: cluster, port: 6222 }
+    - { name: monitor, port: 8222 }
+---
+# Endereço usado pelos clientes (gateway e encaminhador).
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  namespace: monitoramento
+spec:
+  selector:
+    app: nats
+  ports:
+    - { name: client, port: 4222 }
+    - { name: monitor, port: 8222 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nats
+  namespace: monitoramento
+spec:
+  serviceName: nats-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: nats
+  template:
+    metadata:
+      labels:
+        app: nats
+    spec:
+      topologySpreadConstraints:   # um servidor por nó, sempre que possível
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: nats
+      containers:
+        - name: nats
+          image: nats:2.10.24-alpine
+          args: ["-c", "/etc/nats/nats.conf"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - { name: client, containerPort: 4222 }
+            - { name: cluster, containerPort: 6222 }
+            - { name: monitor, containerPort: 8222 }
+          readinessProbe:
+            httpGet:
+              path: /healthz?js-enabled-only=true
+              port: monitor
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz?js-enabled-only=true
+              port: monitor
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - { name: config, mountPath: /etc/nats }
+            - { name: dados, mountPath: /data }
+      volumes:
+        - name: config
+          configMap:
+            name: nats-config
+  volumeClaimTemplates:
+    - metadata:
+        name: dados
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 3Gi

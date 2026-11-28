@@ -22,7 +22,7 @@
 #   make teste-autorizado-restaurar  volta o gateway ao normal
 
 CLUSTER := monitoramento
-IMAGENS := gateway dashboard
+IMAGENS := gateway encaminhador dashboard
 TAG     := 0.1
 NS      := monitoramento
 
@@ -35,6 +35,9 @@ cluster:
 	kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
 	kubectl -n kube-system patch deployment metrics-server --type=json \
 		-p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+	# KEDA: escala o encaminhador pelo tamanho da fila do NATS
+	kubectl apply --server-side -f https://github.com/kedacore/keda/releases/download/v2.16.1/keda-2.16.1.yaml
+	kubectl -n keda rollout status deployment/keda-operator --timeout=180s
 
 build:
 	@for s in $(IMAGENS); do \
@@ -45,10 +48,13 @@ load:
 	kind load docker-image $(foreach s,$(IMAGENS),monitoramento/$(s):$(TAG)) --name $(CLUSTER)
 
 deploy:
+	kubectl apply -f k8s/00-namespace-config.yaml -f k8s/05-nats.yaml
+	kubectl -n $(NS) rollout status statefulset/nats --timeout=240s
 	kubectl apply -f k8s/
 
 up: build load deploy
 	kubectl -n $(NS) rollout status deployment/gateway --timeout=120s
+	kubectl -n $(NS) rollout status deployment/encaminhador --timeout=120s
 	kubectl -n $(NS) rollout status deployment/dashboard --timeout=120s
 	kubectl -n $(NS) get pods -o wide
 
@@ -68,7 +74,7 @@ ps:
 	kubectl -n $(NS) get hpa
 
 logs:
-	kubectl -n $(NS) logs -l app=gateway -f --prefix
+	kubectl -n $(NS) logs -l 'app in (gateway,encaminhador)' -f --prefix
 
 down:
 	kind delete cluster --name $(CLUSTER)
@@ -84,9 +90,11 @@ teste-preparar:
 	kind load docker-image monitoramento/mock-interscity:$(TAG) --name $(CLUSTER)
 	kubectl apply -f testes/mock-interscity.yaml
 	kubectl -n $(NS) rollout status deployment/mock-interscity --timeout=120s
-	kubectl -n $(NS) set env deployment/gateway INTERSCITY_URL=$(MOCK) LOG_LEVEL=WARNING
+	kubectl -n $(NS) set env deployment/encaminhador INTERSCITY_URL=$(MOCK)
+	kubectl -n $(NS) set env deployment/gateway LOG_LEVEL=WARNING
 	kubectl -n $(NS) set env deployment/dashboard INTERSCITY_URL=$(MOCK)
 	kubectl -n $(NS) rollout status deployment/gateway --timeout=120s
+	kubectl -n $(NS) rollout status deployment/encaminhador --timeout=120s
 	kubectl -n $(NS) rollout status deployment/dashboard --timeout=120s
 
 teste-gateway:
@@ -103,10 +111,11 @@ teste-dashboard: .venv-testes/bin/python
 	.venv-testes/bin/python testes/carga_dashboard.py --usuarios $(USUARIOS)
 
 teste-monitorar:
-	watch -n 2 'kubectl -n $(NS) get hpa; echo; kubectl -n $(NS) top pods; echo; kubectl -n $(NS) get pods -o wide'
+	python3 testes/monitorar_teste.py --saida testes/resultado-monitor
 
 teste-restaurar:
-	kubectl -n $(NS) set env deployment/gateway INTERSCITY_URL- LOG_LEVEL-
+	kubectl -n $(NS) set env deployment/encaminhador INTERSCITY_URL-
+	kubectl -n $(NS) set env deployment/gateway LOG_LEVEL-
 	kubectl -n $(NS) set env deployment/dashboard INTERSCITY_URL-
 	kubectl delete -f testes/mock-interscity.yaml --ignore-not-found
 

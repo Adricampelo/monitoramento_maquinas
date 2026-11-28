@@ -1,0 +1,77 @@
+# Encaminhador: consome a fila TELEMETRIA e entrega ao InterSCity em lote.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: encaminhador
+  namespace: monitoramento
+  labels:
+    app: encaminhador
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: encaminhador
+  template:
+    metadata:
+      labels:
+        app: encaminhador
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: encaminhador
+      containers:
+        - name: encaminhador
+          image: monitoramento/encaminhador:0.1
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: interscity
+          env:
+            - { name: NATS_URL, value: "nats://nats:4222" }
+            - { name: MAX_EM_VOO, value: "4" }   # POSTs simultâneos por réplica
+            - { name: JANELA, value: "1.0" }     # s esperando juntar um lote
+          ports:
+            - { name: http, containerPort: 8001 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+# Escala pelo tamanho da fila (leituras ainda não entregues), não por CPU:
+# o encaminhador passa a maior parte do tempo esperando o InterSCity, então
+# CPU não diz nada sobre o atraso. O teto de réplicas é também um teto de
+# carga sobre o InterSCity (réplicas x MAX_EM_VOO POSTs simultâneos).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: encaminhador
+  namespace: monitoramento
+spec:
+  scaleTargetRef:
+    name: encaminhador
+  minReplicaCount: 2
+  maxReplicaCount: 6
+  pollingInterval: 5
+  cooldownPeriod: 60
+  triggers:
+    - type: nats-jetstream
+      metadata:
+        natsServerMonitoringEndpoint: "nats-headless.monitoramento.svc.cluster.local:8222"
+        account: "$G"
+        stream: "TELEMETRIA"
+        consumer: "encaminhador"
+        lagThreshold: "2000"   # uma réplica a mais a cada 2000 leituras na fila
+        useHttps: "false"

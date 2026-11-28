@@ -30,14 +30,17 @@ preparar() {
   echo "== 1. Gateway apontando para o InterSCity real, com as máquinas de teste"
   local atuais
   atuais=$(kubectl -n "$NS" get configmap interscity -o jsonpath='{.data.MAQUINAS}')
-  kubectl -n "$NS" set env deployment/gateway \
-    "MAQUINAS=${atuais},${MAQUINAS_EXTRA}" LOG_LEVEL=WARNING INTERSCITY_URL-
+  # gateway valida o id; encaminhador traduz para o uuid e entrega
+  kubectl -n "$NS" set env deployment/gateway deployment/encaminhador \
+    "MAQUINAS=${atuais},${MAQUINAS_EXTRA}" INTERSCITY_URL-
+  kubectl -n "$NS" set env deployment/gateway LOG_LEVEL=WARNING
 
-  echo "== 2. Mínimo de 4 réplicas (o HPA ainda pode subir até 6)"
-  kubectl -n "$NS" patch hpa gateway -p '{"spec":{"minReplicas":4,"maxReplicas":6}}'
+  echo "== 2. Mínimo de 4 réplicas do gateway (o HPA ainda pode subir até 8)"
+  kubectl -n "$NS" patch hpa gateway -p '{"spec":{"minReplicas":4,"maxReplicas":8}}'
   kubectl -n "$NS" scale deployment/gateway --replicas=4
   kubectl -n "$NS" rollout status deployment/gateway --timeout=180s
-  kubectl -n "$NS" get pods -l app=gateway -o wide
+  kubectl -n "$NS" rollout status deployment/encaminhador --timeout=180s
+  kubectl -n "$NS" get pods -l 'app in (gateway,encaminhador,nats)' -o wide
 
   echo "== 3. Envio de conferência (1 leitura)"
   local primeira="${MAQUINAS_TESTE%%,*}"
@@ -46,7 +49,7 @@ preparar() {
     -d "{\"maquina_id\":\"${primeira}\",\"temp\":60,\"vibra\":2}" \
     -w "  (HTTP %{http_code})\n"
   echo
-  echo "Se apareceu HTTP 201 acima, está tudo pronto: make teste-autorizado"
+  echo "Se apareceu HTTP 202 acima, está tudo pronto: make teste-autorizado"
 }
 
 disparar() {
@@ -62,10 +65,12 @@ disparar() {
            Ctrl+C também interrompe a qualquer momento.
 
 EOF
-  read -r -p "Digite SIM para disparar: " resposta
-  [ "$resposta" = "SIM" ] || { echo "cancelado"; exit 1; }
+  if [ "${CONFIRMAR:-}" != "SIM" ]; then
+    read -r -p "Digite SIM para disparar: " resposta
+    [ "$resposta" = "SIM" ] || { echo "cancelado"; exit 1; }
+  fi
 
-  docker run --rm -i --network host --user "$(id -u):$(id -g)" \
+  docker run --rm -i --name k6-autorizado --network host --user "$(id -u):$(id -g)" \
     -e CENARIO=autorizado -e URL=http://localhost:8000 \
     -e MAQUINAS_TESTE="$MAQUINAS_TESTE" \
     -v "$RAIZ/testes:/testes" "$K6" run \
@@ -74,10 +79,12 @@ EOF
 }
 
 restaurar() {
-  kubectl -n "$NS" set env deployment/gateway MAQUINAS- LOG_LEVEL-
-  kubectl -n "$NS" patch hpa gateway -p '{"spec":{"minReplicas":2,"maxReplicas":5}}'
+  kubectl -n "$NS" set env deployment/gateway deployment/encaminhador MAQUINAS-
+  kubectl -n "$NS" set env deployment/gateway LOG_LEVEL-
+  kubectl -n "$NS" patch hpa gateway -p '{"spec":{"minReplicas":2,"maxReplicas":8}}'
   kubectl -n "$NS" rollout status deployment/gateway --timeout=180s
-  echo "gateway restaurado (máquinas do ConfigMap, HPA 2–5)"
+  kubectl -n "$NS" rollout status deployment/encaminhador --timeout=180s
+  echo "restaurado (máquinas do ConfigMap, HPA do gateway 2–8)"
 }
 
 case "${1:-}" in
